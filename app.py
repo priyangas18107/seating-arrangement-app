@@ -1,7 +1,6 @@
 import io
+import re
 from collections import defaultdict
-from itertools import zip_longest
-from xml.sax.saxutils import escape
 
 import pandas as pd
 from openpyxl import Workbook
@@ -31,7 +30,7 @@ def compress(regs):
     return ", ".join(parts)
 
 
-def allocate(students, rooms):
+def allocate(students, rooms, per_bench=1):
     """students: DataFrame(reg_no, department, subcode, ...); rooms: list of (room_no, capacity).
     Each room is filled with 2-3 different departments (largest remaining dept first),
     so same-department students are not all together."""
@@ -40,6 +39,7 @@ def allocate(students, rooms):
     placed = []  # (room_no, student_index)
     used_rooms = []
     for room, cap in rooms:
+        cap = cap * per_bench
         if not any(queues.values()):
             break
         left, used = cap, set()
@@ -71,12 +71,16 @@ def allocate(students, rooms):
         seats = []  # department of every seat position
         order = []
         total = sum(len(v) for v in groups.values())
+        pb = per_bench
         for pos in range(total):
+            bench, side = divmod(pos, pb)
             banned = set()
-            if pos % ROWS != 0:
-                banned.add(seats[pos - 1])
-            if pos >= ROWS:
-                banned.add(seats[pos - ROWS])
+            if side > 0:
+                banned.add(seats[pos - 1])           # partner on the same bench
+            if bench % ROWS != 0:
+                banned.add(seats[pos - pb])          # bench above (same column)
+            if bench >= ROWS:
+                banned.add(seats[pos - ROWS * pb])   # bench on the left (same row)
             avail = [d for d in groups if groups[d]]
             ok = [d for d in avail if d not in banned] or avail
             d = max(ok, key=lambda x: len(groups[x]))
@@ -101,6 +105,20 @@ def room_grid(regs, rows=ROWS):
     return data, cols
 
 
+def bench_grid(regs, pb, rows=ROWS):
+    """IAT layout: each cell = one bench holding `pb` students; numbered column-wise."""
+    benches = [regs[i:i + pb] for i in range(0, len(regs), pb)]
+    cols = -(-len(benches) // rows)
+    data = []
+    for r in range(rows):
+        line = []
+        for c in range(cols):
+            i = c * rows + r
+            line += [i + 1, benches[i]] if i < len(benches) else ["", []]
+        data.append(line)
+    return data, cols
+
+
 def notice_rows(alloc, used_rooms):
     rows = []
     for room in used_rooms:
@@ -116,12 +134,27 @@ def notice_rows(alloc, used_rooms):
     return rows
 
 
+def qp_rows(alloc, used_rooms):
+    """Question paper split-up: room wise, subject code wise count."""
+    rows = []
+    for room in used_rooms:
+        sub = alloc[alloc.room_no == room]
+        for code, g in sub.groupby("subcode", sort=True):
+            rows.append({"Roomno": room, "SubCode": code, "Papers": len(g)})
+    return rows
+
+
+def qp_summary(alloc):
+    g = alloc.groupby("subcode").size()
+    return [(c, int(n)) for c, n in g.items()]
+
+
 # ---------------------------------------------------------------- excel
 THIN = Side(style="thin")
 BOX = Border(left=THIN, right=THIN, top=THIN, bottom=THIN)
 
 
-def make_excel(alloc, used_rooms, title, date, session):
+def make_excel(alloc, used_rooms, title, date, session, per_bench=1):
     rows = notice_rows(alloc, used_rooms)
     wb = Workbook()
 
@@ -147,6 +180,34 @@ def make_excel(alloc, used_rooms, title, date, session):
     for col, w in zip("ABCDE", (10, 10, 70, 10, 8)):
         ws.column_dimensions[col].width = w
 
+    wq = wb.create_sheet("QP Split-up")
+    wq["A1"] = title
+    wq["A1"].font = Font(name="Arial", bold=True, size=14)
+    wq["A2"] = f"QUESTION PAPER SPLIT-UP      DATE: {date}      SESSION: {session}"
+    wq["A2"].font = Font(name="Arial", bold=True)
+    for j, h in enumerate(["Room No", "Subject Code", "No. of Question Papers"], 1):
+        c = wq.cell(row=4, column=j, value=h)
+        c.font = Font(name="Arial", bold=True)
+        c.border = BOX
+    r = 5
+    for row in qp_rows(alloc, used_rooms):
+        for j, v in enumerate([row["Roomno"], row["SubCode"], row["Papers"]], 1):
+            c = wq.cell(row=r, column=j, value=v)
+            c.font = Font(name="Arial")
+            c.border = BOX
+        r += 1
+    r += 1
+    wq.cell(row=r, column=1, value="SUBJECT WISE TOTAL").font = Font(name="Arial", bold=True)
+    r += 1
+    for code, n in qp_summary(alloc):
+        wq.cell(row=r, column=2, value=code).font = Font(name="Arial")
+        wq.cell(row=r, column=3, value=n).font = Font(name="Arial")
+        r += 1
+    wq.cell(row=r, column=2, value="TOTAL").font = Font(name="Arial", bold=True)
+    wq.cell(row=r, column=3, value=len(alloc)).font = Font(name="Arial", bold=True)
+    for col, w in zip("ABC", (12, 16, 24)):
+        wq.column_dimensions[col].width = w
+
     wa = wb.create_sheet("Allocation")
     cols = ["reg_no", "name", "department", "subcode", "room_no"]
     cols = [c for c in cols if c in alloc.columns]
@@ -165,8 +226,13 @@ def make_excel(alloc, used_rooms, title, date, session):
         w["A2"] = f"DATE: {date}      SESSION: {session}"
         w.append([])
         regs = list(alloc[alloc.room_no == room].reg_no)
-        data, cols = room_grid(regs)
-        w.append(["S.No", "Reg No"] * cols)
+        if per_bench == 1:
+            data, cols = room_grid(regs)
+            w.append(["S.No", "Reg No"] * cols)
+        else:
+            data, cols = bench_grid(regs, per_bench)
+            w.append(["Bench", "Reg No (2 students)"] * cols)
+            data = [[(v if not isinstance(v, list) else "\n".join(v)) for v in line] for line in data]
         for c in w[4]:
             c.font = Font(name="Arial", bold=True)
             c.border = BOX
@@ -174,6 +240,12 @@ def make_excel(alloc, used_rooms, title, date, session):
             w.append(line)
             for c in w[w.max_row]:
                 c.border = BOX
+                c.alignment = Alignment(wrap_text=True, vertical="top")
+            if per_bench > 1:
+                w.row_dimensions[w.max_row].height = 32
+        sig_row = w.max_row + 4
+        w.cell(row=sig_row, column=1, value="______________________").font = Font(name="Arial")
+        w.cell(row=sig_row + 1, column=1, value="External Signature").font = Font(name="Arial", bold=True)
         for k in range(cols):
             w.column_dimensions[chr(65 + 2 * k)].width = 7
             w.column_dimensions[chr(66 + 2 * k)].width = 18
@@ -217,117 +289,213 @@ def make_notice_pdf(alloc, used_rooms, title, date, session):
     return buf.getvalue()
 
 
-def make_room_pdf(alloc, used_rooms, title, date, session, center, caps):
-    """One A4 portrait page per room, in the university hall-chart format:
-    header block, Subcode/Total strip, then Stno | Dept(+subcode) | Regno grid
-    (5 rows, seats numbered column-wise), signature line at the bottom."""
+def make_qp_pdf(alloc, used_rooms, title, date, session):
     ss = getSampleStyleSheet()
-    margin = 28
-    width = A4[0] - 2 * margin
-
-    title_st = ParagraphStyle("t", parent=ss["Normal"], fontName="Helvetica", fontSize=10, alignment=TA_CENTER)
-    info_st = ParagraphStyle("i", parent=ss["Normal"], fontName="Helvetica-Bold", fontSize=8, leading=10)
-    dept_st = ParagraphStyle("d", parent=ss["Normal"], fontName="Helvetica", alignment=TA_CENTER,
-                             fontSize=7, leading=8)
-    foot_st = ParagraphStyle("f", parent=ss["Normal"], fontName="Helvetica", fontSize=9)
-
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=margin, rightMargin=margin,
-                            topMargin=40, bottomMargin=30)
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=40, rightMargin=40, topMargin=30, bottomMargin=30)
+    el = [
+        Paragraph(f"<b>{title}</b>", ss["Title"]),
+        Paragraph(f"<b>QUESTION PAPER SPLIT-UP</b> &nbsp;&nbsp; DATE: {date} &nbsp;&nbsp; SESSION: {session}", ss["Normal"]),
+        Spacer(1, 10),
+    ]
+    data = [["Room No", "Subject Code", "No. of Question Papers"]]
+    for r in qp_rows(alloc, used_rooms):
+        data.append([r["Roomno"], r["SubCode"], r["Papers"]])
+    t = Table(data, colWidths=[90, 120, 150], repeatRows=1)
+    t.setStyle(_table_style())
+    el += [t, Spacer(1, 16), Paragraph("<b>SUBJECT WISE TOTAL</b>", ss["Normal"]), Spacer(1, 6)]
+    data2 = [["Subject Code", "Total Question Papers"]] + [[c, n] for c, n in qp_summary(alloc)]
+    data2.append(["TOTAL", len(alloc)])
+    t2 = Table(data2, colWidths=[120, 150])
+    t2.setStyle(_table_style())
+    el.append(t2)
+    doc.build(el)
+    return buf.getvalue()
+
+
+def make_room_pdf_bench(alloc, used_rooms, title, date, session, per_bench=2):
+    """Old layout, only used when per_bench > 1 (IAT)."""
+    ss = getSampleStyleSheet()
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), topMargin=40, bottomMargin=40, leftMargin=20, rightMargin=20)
     el = []
     for k, room in enumerate(used_rooms):
-        sub = alloc[alloc.room_no == room]
-        regs = list(sub.reg_no)
-        depts = list(sub.department)
-        codes = list(sub.subcode)
-        cap = caps.get(room, len(regs))
-
-        el.append(Paragraph(escape(str(title)), title_st))
-        el.append(Spacer(1, 22))
-
-        # header block
-        P = lambda s: Paragraph(escape(str(s)), info_st)
-        info = [
-            [P("EXAM CENTER CODE & NAME"), P(f":{center}"), P("DATE"), P(f":{date}")],
-            [P("TOTAL SEATING CAPACITY"), P(f":{cap}"), P("SESSION"), P(f":{session}")],
-            [P("HALL NO"), P(f":{room}"), P("HALL STRENGTH"), P(f":{len(regs)}")],
+        regs = list(alloc[alloc.room_no == room].reg_no)
+        el += [
+            Paragraph(f"<b>{title}</b>", ss["Heading3"]),
+            Paragraph(f"<b>ROOM: {room}</b> &nbsp;&nbsp; DATE: {date} &nbsp;&nbsp; SESSION: {session} &nbsp;&nbsp; TOTAL: {len(regs)}", ss["Normal"]),
+            Spacer(1, 12),
         ]
-        t = Table(info, colWidths=[width * 0.30, width * 0.34, width * 0.18, width * 0.18])
-        t.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
-                               ("TOPPADDING", (0, 0), (-1, -1), 2),
-                               ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
-                               ("LEFTPADDING", (0, 0), (-1, -1), 2)]))
-        el += [t, Spacer(1, 14)]
-
-        # Subcode / Total strip (one pair per department in this room)
-        strip_head, strip_val = [], []
-        for dept, g in sub.groupby("department", sort=False):
-            strip_head += ["Subcode", "Total"]
-            strip_val += [g.subcode.iloc[0], len(g)]
-        n = len(strip_head) // 2
-        t = Table([strip_head, strip_val], colWidths=[62, 40] * n, hAlign="CENTER")
-        t.setStyle(TableStyle([
-            ("GRID", (0, 0), (-1, -1), 0.75, colors.black),
-            ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, -1), 7.5),
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-        ]))
-        el += [t, Spacer(1, 12)]
-
-        # seat grid: Stno | Dept (+subcode) | Regno, 5 rows, numbered column-wise
-        cols = max(1, -(-len(regs) // ROWS))
-        group_w = width / cols
-        w_no, w_dept = group_w * 0.15, group_w * 0.28
-        w_reg = group_w - w_no - w_dept
-        longest = max(len(str(r)) for r in regs)
-        fs = min(9.5, (w_reg - 2) / (longest * 0.556))  # Helvetica-Bold digit = 0.556 em
-
-        head = ["Stno", "Dept", "Regno"] * cols
-        data = [head]
-        for r in range(ROWS):
-            line = []
-            for c in range(cols):
-                i = c * ROWS + r
-                if i < len(regs):
-                    dept_cell = Paragraph(
-                        f'<font size="8"><b>{escape(str(depts[i]))}</b></font><br/>'
-                        f'<font size="6">{escape(str(codes[i]))}</font>', dept_st)
-                    line += [i + 1, dept_cell, regs[i]]
-                else:
-                    line += ["", "", ""]
-            data.append(line)
-        t = Table(data, colWidths=[w_no, w_dept, w_reg] * cols, rowHeights=[24] + [30] * ROWS)
-        style = [
-            ("GRID", (0, 0), (-1, -1), 0.75, colors.black),
-            ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"),
-            ("FONTSIZE", (0, 0), (-1, 0), 8),
-            ("FONTSIZE", (0, 1), (-1, -1), fs),
-            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
-            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
-            ("LEFTPADDING", (0, 0), (-1, -1), 1),
-            ("RIGHTPADDING", (0, 0), (-1, -1), 1),
-        ]
-        for c in range(cols):  # Stno column a bit smaller
-            style.append(("FONTSIZE", (3 * c, 0), (3 * c, 0), 6))
-            style.append(("FONTSIZE", (3 * c, 1), (3 * c, -1), 8))
-        t.setStyle(TableStyle(style))
-        el += [t, Spacer(1, 70)]
-
-        foot = Table([[Paragraph("Name Sign of Hall Superintendent(Name in Block Letters)", foot_st),
-                       Paragraph("CHIEF SUPERINTENDENT", foot_st)]],
-                     colWidths=[width * 0.62, width * 0.38])
-        foot.setStyle(TableStyle([("LEFTPADDING", (0, 0), (-1, -1), 40)]))
-        el.append(foot)
-
+        grid, cols = bench_grid(regs, per_bench)
+        grid = [[(v if not isinstance(v, list) else Paragraph("<br/>".join(v), ss["Normal"])) for v in line] for line in grid]
+        data = [["Bench", "Reg No"] * cols] + grid
+        t = Table(data, colWidths=[38, 82] * cols, rowHeights=[22] + [40] * len(grid))
+        t.setStyle(_table_style())
+        el.append(t)
+        el.append(Spacer(1, 70))
+        el.append(Paragraph("______________________________<br/><b>External Signature</b>", ss["Normal"]))
         if k < len(used_rooms) - 1:
             el.append(PageBreak())
     doc.build(el)
     return buf.getvalue()
 
 
+def make_room_pdf(alloc, used_rooms, title, date, session, per_bench=1,
+                  center="5115-PTLEE COLLEGE OF ENGG", caps=None):
+    """Anna University hall sheet layout (1 student per bench)."""
+    if per_bench != 1:
+        return make_room_pdf_bench(alloc, used_rooms, title, date, session, per_bench)
+    caps = caps or {}
+    ss = getSampleStyleSheet()
+    ttl = ParagraphStyle("ttl", parent=ss["Normal"], fontName="Helvetica", fontSize=10, alignment=TA_CENTER)
+    lab = ParagraphStyle("lab", parent=ss["Normal"], fontName="Helvetica-Bold", fontSize=8, leading=10)
+    cell = ParagraphStyle("cell", parent=ss["Normal"], fontName="Helvetica", fontSize=6,
+                          leading=7, alignment=TA_CENTER)
+
+    buf = io.BytesIO()
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), topMargin=25, bottomMargin=25,
+                            leftMargin=25, rightMargin=25)
+    W = landscape(A4)[0] - 50
+    el = []
+    for k, room in enumerate(used_rooms):
+        sub = alloc[alloc.room_no == room]
+        n = len(sub)
+        cap = max(int(caps.get(room, n)), n)
+
+        el.append(Paragraph(title, ttl))
+        el.append(Spacer(1, 14))
+
+        # ---- header block
+        L = lambda t: Paragraph(t, lab)
+        hdr = Table([
+            [L("EXAM CENTER CODE &amp; NAME"), L(f":{center}"), L("DATE"), L(f":{date}")],
+            [L("TOTAL SEATING CAPACITY"), L(f":{cap}"), L("SESSION"), L(f":{session}")],
+            [L("HALL NO"), L(f":{room}"), L("HALL STRENGTH"), L(f":{n}")],
+        ], colWidths=[W * 0.27, W * 0.28, W * 0.2, W * 0.25])
+        hdr.setStyle(TableStyle([("TOPPADDING", (0, 0), (-1, -1), 2),
+                                 ("BOTTOMPADDING", (0, 0), (-1, -1), 2)]))
+        el += [hdr, Spacer(1, 10)]
+
+        # ---- subcode / total box
+        head, vals = [], []
+        for dept, g in sub.groupby("department", sort=False):
+            head += ["Subcode", "Total"]
+            vals += [g.subcode.iloc[0], len(g)]
+        box = Table([head, vals], colWidths=[75, 60] * (len(head) // 2))
+        box.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
+            ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 7),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+        ]))
+        el += [box, Spacer(1, 10)]
+
+        # ---- seat grid: 5 rows, numbered column-wise
+        rec = list(sub.itertuples())
+        cols = -(-cap // ROWS)
+        gw = W / cols
+        sw, dw = 26, 40
+        data = [["Stno", "Dept", "Regno"] * cols]
+        for r in range(ROWS):
+            line = []
+            for c in range(cols):
+                i = c * ROWS + r
+                if i < len(rec):
+                    s = rec[i]
+                    line += [i + 1, Paragraph(f"{s.department}<br/>{s.subcode}", cell), s.reg_no]
+                else:
+                    line += ["", "", ""]
+            data.append(line)
+        t = Table(data, colWidths=[sw, dw, gw - sw - dw] * cols, rowHeights=[24] + [30] * ROWS)
+        t.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 8),
+            ("FONTSIZE", (0, 1), (-1, -1), 9),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ]))
+        el += [t, Spacer(1, 45)]
+
+        # ---- sign-off
+        foot = Table([[Paragraph("Name Sign of Hall Superintendent(Name in Block Letters)", ss["Normal"]),
+                       Paragraph("CHIEF SUPERINTENDENT", ss["Normal"])]],
+                     colWidths=[W * 0.6, W * 0.4])
+        el.append(foot)
+        if k < len(used_rooms) - 1:
+            el.append(PageBreak())
+    doc.build(el)
+    return buf.getvalue()
+
+
+# ---------------------------------------------------------------- pdf input
+DEPT_CODES = {"104": "CSE", "106": "ECE", "105": "EEE", "114": "MECH",
+              "103": "CIVIL", "205": "IT", "243": "AI&DS"}
+
+
+def regs_from_text(text):
+    """Find all 12-digit reg nos (5115........) in text. 'A to B' ranges are expanded."""
+    regs = []
+    covered = []
+    for m in re.finditer(r"(?<!\d)(5115\d{8})\s*to\s*(5115\d{8})(?!\d)", text):
+        a, b = m.group(1), m.group(2)
+        if a[:9] == b[:9] and int(a) <= int(b) and int(b) - int(a) < 500:
+            regs += [str(n) for n in range(int(a), int(b) + 1)]
+            covered.append(m.span())
+    rest = text
+    for st, en in reversed(covered):
+        rest = rest[:st] + " " + rest[en:]
+    regs += re.findall(r"(?<!\d)5115\d{8}(?!\d)", rest)
+    seen, out = set(), []
+    for r in regs:
+        if r not in seen:
+            seen.add(r)
+            out.append(r)
+    return out
+
+
+def students_from_pdf(f):
+    from pypdf import PdfReader
+
+    text = "\n".join((p.extract_text() or "") for p in PdfReader(f).pages)
+    regs = regs_from_text(text)
+    return pd.DataFrame({
+        "reg_no": regs,
+        "department": [DEPT_CODES.get(r[6:9], "DEPT-" + r[6:9]) for r in regs],
+    })
+
+
+def rooms_from_pdf(f, default_capacity=25):
+    """Rooms PDF: room numbers like F02 / S11 / A101, optionally followed by capacity."""
+    from pypdf import PdfReader
+
+    text = "\n".join((p.extract_text() or "") for p in PdfReader(f).pages)
+    rooms, seen = [], set()
+    for line in text.splitlines():
+        toks = line.split()
+        for i, t in enumerate(toks):
+            if re.fullmatch(r"[A-Z]{1,2}\d{2,3}", t) and t not in seen:
+                cap = default_capacity
+                if i + 1 < len(toks) and toks[i + 1].isdigit() and 1 <= int(toks[i + 1]) <= 200:
+                    cap = int(toks[i + 1])
+                seen.add(t)
+                rooms.append((t, cap))
+                break
+    return pd.DataFrame(rooms, columns=["room_no", "capacity"]).astype(str)
+
+
+def read_rooms(f):
+    if f.name.lower().endswith(".pdf"):
+        return rooms_from_pdf(f)
+    if f.name.lower().endswith((".xlsx", ".xls")):
+        return pd.read_excel(f, dtype=str)
+    return pd.read_csv(f, dtype=str)
+
+
 # ---------------------------------------------------------------- UI
 def read_any(f):
+    if f.name.lower().endswith(".pdf"):
+        return students_from_pdf(f)
     if f.name.lower().endswith((".xlsx", ".xls")):
         return pd.read_excel(f, dtype=str)
     return pd.read_csv(f, dtype=str)
@@ -339,19 +507,21 @@ def main():
     st.set_page_config(page_title="Exam Seating", layout="wide")
     st.title("Exam Room Allotment")
 
+    pb = 1  # Anna University theory exam: 1 student per bench
+    default_title = "ANNA UNIVERSITY THEORY EXAMINATIONS NOV-DEC-2026"
     c1, c2, c3 = st.columns([3, 1, 1])
-    title = c1.text_input("Exam title", "ANNA UNIVERSITY THEORY EXAMINATIONS NOV-DEC-2026")
+    title = c1.text_input("Exam title", default_title, key=f"title_{pb}")
     date = c2.date_input("Date").strftime("%d-%b-%Y")
     session = c3.selectbox("Session", ["FN", "AN"])
-    center = st.text_input("Exam center code & name", "5115-PTLEE COLLEGE OF ENGG")
+    center = st.text_input("Exam centre code & name", "5115-PTLEE COLLEGE OF ENGG")
 
-    f1 = st.file_uploader("Students file (reg_no, department)", type=["csv", "xlsx"])
-    f2 = st.file_uploader("Rooms file (room_no, capacity)", type=["csv", "xlsx"])
+    f1 = st.file_uploader("Students file (PDF / Excel / CSV)", type=["pdf", "csv", "xlsx"])
+    f2 = st.file_uploader("Rooms file (PDF / Excel / CSV: room_no, capacity = number of benches)", type=["pdf", "csv", "xlsx"])
     if not (f1 and f2):
         st.info("Rendu file um upload pannunga.")
         return
 
-    students, rooms_df = read_any(f1), read_any(f2)
+    students, rooms_df = read_any(f1), read_rooms(f2)
     for need, df in (("reg_no", students), ("department", students), ("room_no", rooms_df), ("capacity", rooms_df)):
         if need not in df.columns:
             st.error(f"'{need}' column file la illa. Header check pannunga.")
@@ -368,20 +538,22 @@ def main():
     if st.button("Allocate", type="primary"):
         rooms = [(r.room_no, int(r.capacity)) for r in rooms_df.itertuples()]
         try:
-            alloc, used = allocate(students, rooms)
+            alloc, used = allocate(students, rooms, pb)
         except ValueError as e:
             st.error(str(e))
             return
-        st.session_state["res"] = (alloc, used, dict(rooms))
+        st.session_state["res"] = (alloc, used)
 
     if "res" in st.session_state:
-        alloc, used, caps = st.session_state["res"]
+        alloc, used = st.session_state["res"]
+        caps = {r.room_no: int(r.capacity) for r in rooms_df.itertuples()}
         st.success(f"{len(alloc)} students, {len(used)} rooms")
         st.dataframe(pd.DataFrame(notice_rows(alloc, used)), use_container_width=True)
-        d1, d2, d3 = st.columns(3)
-        d1.download_button("Excel (all sheets)", make_excel(alloc, used, title, date, session), "allotment.xlsx")
+        d1, d2, d3, d4 = st.columns(4)
+        d1.download_button("Excel (all sheets)", make_excel(alloc, used, title, date, session, pb), "allotment.xlsx")
         d2.download_button("Notice board PDF", make_notice_pdf(alloc, used, title, date, session), "notice_board.pdf")
-        d3.download_button("Room wise PDF", make_room_pdf(alloc, used, title, date, session, center, caps), "room_wise.pdf")
+        d3.download_button("Room wise PDF", make_room_pdf(alloc, used, title, date, session, pb, center, caps), "room_wise.pdf")
+        d4.download_button("Question paper split-up PDF", make_qp_pdf(alloc, used, title, date, session), "question_paper_splitup.pdf")
 
 
 if __name__ == "__main__":
