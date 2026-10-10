@@ -1,13 +1,15 @@
 import io
 from collections import defaultdict
 from itertools import zip_longest
+from xml.sax.saxutils import escape
 
 import pandas as pd
 from openpyxl import Workbook
 from openpyxl.styles import Alignment, Border, Font, Side
 from reportlab.lib import colors
+from reportlab.lib.enums import TA_CENTER
 from reportlab.lib.pagesizes import A4, landscape
-from reportlab.lib.styles import getSampleStyleSheet
+from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, Table, TableStyle
 
 
@@ -215,23 +217,109 @@ def make_notice_pdf(alloc, used_rooms, title, date, session):
     return buf.getvalue()
 
 
-def make_room_pdf(alloc, used_rooms, title, date, session):
+def make_room_pdf(alloc, used_rooms, title, date, session, center, caps):
+    """One A4 portrait page per room, in the university hall-chart format:
+    header block, Subcode/Total strip, then Stno | Dept(+subcode) | Regno grid
+    (5 rows, seats numbered column-wise), signature line at the bottom."""
     ss = getSampleStyleSheet()
+    margin = 28
+    width = A4[0] - 2 * margin
+
+    title_st = ParagraphStyle("t", parent=ss["Normal"], fontName="Helvetica", fontSize=10, alignment=TA_CENTER)
+    info_st = ParagraphStyle("i", parent=ss["Normal"], fontName="Helvetica-Bold", fontSize=8, leading=10)
+    dept_st = ParagraphStyle("d", parent=ss["Normal"], fontName="Helvetica", alignment=TA_CENTER,
+                             fontSize=7, leading=8)
+    foot_st = ParagraphStyle("f", parent=ss["Normal"], fontName="Helvetica", fontSize=9)
+
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), topMargin=40, bottomMargin=40, leftMargin=20, rightMargin=20)
+    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=margin, rightMargin=margin,
+                            topMargin=40, bottomMargin=30)
     el = []
     for k, room in enumerate(used_rooms):
-        regs = list(alloc[alloc.room_no == room].reg_no)
-        el += [
-            Paragraph(f"<b>{title}</b>", ss["Heading3"]),
-            Paragraph(f"<b>ROOM: {room}</b> &nbsp;&nbsp; DATE: {date} &nbsp;&nbsp; SESSION: {session} &nbsp;&nbsp; TOTAL: {len(regs)}", ss["Normal"]),
-            Spacer(1, 12),
+        sub = alloc[alloc.room_no == room]
+        regs = list(sub.reg_no)
+        depts = list(sub.department)
+        codes = list(sub.subcode)
+        cap = caps.get(room, len(regs))
+
+        el.append(Paragraph(escape(str(title)), title_st))
+        el.append(Spacer(1, 22))
+
+        # header block
+        P = lambda s: Paragraph(escape(str(s)), info_st)
+        info = [
+            [P("EXAM CENTER CODE & NAME"), P(f":{center}"), P("DATE"), P(f":{date}")],
+            [P("TOTAL SEATING CAPACITY"), P(f":{cap}"), P("SESSION"), P(f":{session}")],
+            [P("HALL NO"), P(f":{room}"), P("HALL STRENGTH"), P(f":{len(regs)}")],
         ]
-        grid, cols = room_grid(regs)
-        data = [["S.No", "Reg No"] * cols] + grid
-        t = Table(data, colWidths=[32, 88] * cols, rowHeights=26)
-        t.setStyle(_table_style())
-        el.append(t)
+        t = Table(info, colWidths=[width * 0.30, width * 0.34, width * 0.18, width * 0.18])
+        t.setStyle(TableStyle([("VALIGN", (0, 0), (-1, -1), "TOP"),
+                               ("TOPPADDING", (0, 0), (-1, -1), 2),
+                               ("BOTTOMPADDING", (0, 0), (-1, -1), 2),
+                               ("LEFTPADDING", (0, 0), (-1, -1), 2)]))
+        el += [t, Spacer(1, 14)]
+
+        # Subcode / Total strip (one pair per department in this room)
+        strip_head, strip_val = [], []
+        for dept, g in sub.groupby("department", sort=False):
+            strip_head += ["Subcode", "Total"]
+            strip_val += [g.subcode.iloc[0], len(g)]
+        n = len(strip_head) // 2
+        t = Table([strip_head, strip_val], colWidths=[62, 40] * n, hAlign="CENTER")
+        t.setStyle(TableStyle([
+            ("GRID", (0, 0), (-1, -1), 0.75, colors.black),
+            ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, -1), 7.5),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ]))
+        el += [t, Spacer(1, 12)]
+
+        # seat grid: Stno | Dept (+subcode) | Regno, 5 rows, numbered column-wise
+        cols = max(1, -(-len(regs) // ROWS))
+        group_w = width / cols
+        w_no, w_dept = group_w * 0.15, group_w * 0.28
+        w_reg = group_w - w_no - w_dept
+        longest = max(len(str(r)) for r in regs)
+        fs = min(9.5, (w_reg - 2) / (longest * 0.556))  # Helvetica-Bold digit = 0.556 em
+
+        head = ["Stno", "Dept", "Regno"] * cols
+        data = [head]
+        for r in range(ROWS):
+            line = []
+            for c in range(cols):
+                i = c * ROWS + r
+                if i < len(regs):
+                    dept_cell = Paragraph(
+                        f'<font size="8"><b>{escape(str(depts[i]))}</b></font><br/>'
+                        f'<font size="6">{escape(str(codes[i]))}</font>', dept_st)
+                    line += [i + 1, dept_cell, regs[i]]
+                else:
+                    line += ["", "", ""]
+            data.append(line)
+        t = Table(data, colWidths=[w_no, w_dept, w_reg] * cols, rowHeights=[24] + [30] * ROWS)
+        style = [
+            ("GRID", (0, 0), (-1, -1), 0.75, colors.black),
+            ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"),
+            ("FONTSIZE", (0, 0), (-1, 0), 8),
+            ("FONTSIZE", (0, 1), (-1, -1), fs),
+            ("ALIGN", (0, 0), (-1, -1), "CENTER"),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 1),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 1),
+        ]
+        for c in range(cols):  # Stno column a bit smaller
+            style.append(("FONTSIZE", (3 * c, 0), (3 * c, 0), 6))
+            style.append(("FONTSIZE", (3 * c, 1), (3 * c, -1), 8))
+        t.setStyle(TableStyle(style))
+        el += [t, Spacer(1, 70)]
+
+        foot = Table([[Paragraph("Name Sign of Hall Superintendent(Name in Block Letters)", foot_st),
+                       Paragraph("CHIEF SUPERINTENDENT", foot_st)]],
+                     colWidths=[width * 0.62, width * 0.38])
+        foot.setStyle(TableStyle([("LEFTPADDING", (0, 0), (-1, -1), 40)]))
+        el.append(foot)
+
         if k < len(used_rooms) - 1:
             el.append(PageBreak())
     doc.build(el)
@@ -255,6 +343,7 @@ def main():
     title = c1.text_input("Exam title", "ANNA UNIVERSITY THEORY EXAMINATIONS NOV-DEC-2026")
     date = c2.date_input("Date").strftime("%d-%b-%Y")
     session = c3.selectbox("Session", ["FN", "AN"])
+    center = st.text_input("Exam center code & name", "5115-PTLEE COLLEGE OF ENGG")
 
     f1 = st.file_uploader("Students file (reg_no, department)", type=["csv", "xlsx"])
     f2 = st.file_uploader("Rooms file (room_no, capacity)", type=["csv", "xlsx"])
@@ -283,16 +372,16 @@ def main():
         except ValueError as e:
             st.error(str(e))
             return
-        st.session_state["res"] = (alloc, used)
+        st.session_state["res"] = (alloc, used, dict(rooms))
 
     if "res" in st.session_state:
-        alloc, used = st.session_state["res"]
+        alloc, used, caps = st.session_state["res"]
         st.success(f"{len(alloc)} students, {len(used)} rooms")
         st.dataframe(pd.DataFrame(notice_rows(alloc, used)), use_container_width=True)
         d1, d2, d3 = st.columns(3)
         d1.download_button("Excel (all sheets)", make_excel(alloc, used, title, date, session), "allotment.xlsx")
         d2.download_button("Notice board PDF", make_notice_pdf(alloc, used, title, date, session), "notice_board.pdf")
-        d3.download_button("Room wise PDF", make_room_pdf(alloc, used, title, date, session), "room_wise.pdf")
+        d3.download_button("Room wise PDF", make_room_pdf(alloc, used, title, date, session, center, caps), "room_wise.pdf")
 
 
 if __name__ == "__main__":
