@@ -1,4 +1,5 @@
 import io
+import json
 import re
 from collections import defaultdict
 from pathlib import Path
@@ -20,6 +21,23 @@ from reportlab.platypus import PageBreak, Paragraph, SimpleDocTemplate, Spacer, 
 
 ROWS = 5  # rows in room-wise sheet
 SIGN_FILE = Path(__file__).with_name("signature.png")  # Chief Superintendent signature + stamp (room wise PDF)
+ROOM_CFG_FILE = Path(__file__).with_name("rooms_config.json")  # remembered room names + default capacity
+
+
+def load_room_cfg():
+    try:
+        d = json.loads(ROOM_CFG_FILE.read_text(encoding="utf-8"))
+        return {"default_capacity": int(d.get("default_capacity", 25)),
+                "room_names": [str(x) for x in d.get("room_names", [])]}
+    except Exception:
+        return {"default_capacity": 25, "room_names": []}
+
+
+def save_room_cfg(cfg):
+    try:
+        ROOM_CFG_FILE.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+    except Exception:
+        pass  # read-only disk: app still works, it just won't remember
 
 
 def clean_signature(raw):
@@ -219,21 +237,26 @@ def make_excel(alloc, used_rooms, title, date, session):
 
 
 # ---------------------------------------------------------------- pdf
+NOTICE_FS = 12  # notice board PDF font size (increase / decrease here)
+
+
 def _table_style():
     return TableStyle([
         ("GRID", (0, 0), (-1, -1), 0.5, colors.black),
         ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
         ("BACKGROUND", (0, 0), (-1, 0), colors.lightgrey),
-        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-        ("FONTSIZE", (0, 0), (-1, -1), 9),
+        ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+        ("FONTSIZE", (0, 0), (-1, -1), NOTICE_FS),
+        ("TOPPADDING", (0, 0), (-1, -1), 5),
+        ("BOTTOMPADDING", (0, 0), (-1, -1), 5),
     ])
 
 
 def make_notice_pdf(alloc, used_rooms, title, date, session):
     ss = getSampleStyleSheet()
     small = ss["BodyText"]
-    small.fontSize = 8
-    small.leading = 10
+    small.fontSize = NOTICE_FS
+    small.leading = NOTICE_FS + 3
     buf = io.BytesIO()
     doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=25, rightMargin=25, topMargin=25, bottomMargin=25)
     el = [
@@ -245,7 +268,7 @@ def make_notice_pdf(alloc, used_rooms, title, date, session):
     data = [["Dept", "SubCode", "Regno", "Roomno", "Total"]]
     for r in notice_rows(alloc, used_rooms):
         data.append([r["Dept"], r["SubCode"], Paragraph(r["Regno"], small), r["Roomno"], r["Total"]])
-    t = Table(data, colWidths=[45, 55, 320, 50, 40], repeatRows=1)
+    t = Table(data, colWidths=[58, 70, 290, 70, 55], repeatRows=1)
     t.setStyle(_table_style())
     el.append(t)
     doc.build(el)
@@ -555,23 +578,43 @@ def main():
                                                               "subname": "Subject"}))
     st.dataframe(summary, use_container_width=True, hide_index=True)
 
-    # rooms: room number every time type pannanum (nothing is remembered / prefilled)
+    # rooms: count = students / default capacity (editable), room names are remembered
+    # for the next exam (saved in rooms_config.json next to app.py)
     st.subheader("Rooms")
+    if "room_cfg" not in st.session_state:
+        st.session_state["room_cfg"] = load_room_cfg()
+    cfg = st.session_state["room_cfg"]  # snapshot at session start, used only for defaults
+    saved_names = cfg["room_names"]
+
     r1, r2 = st.columns(2)
-    n_rooms = int(r1.number_input("Evlo rooms available?", min_value=1, max_value=100,
-                                  value=1, step=1))
     def_cap = int(r2.number_input("Room ku default capacity", min_value=1, max_value=35,
-                                  value=25, step=1))
+                                  value=min(max(cfg["default_capacity"], 1), 35), step=1,
+                                  key="def_cap"))
+    auto_rooms = max(1, -(-n // def_cap))
+    n_rooms = int(r1.number_input(f"Rooms (auto: {n} / {def_cap} = {auto_rooms}. Venumna maathunga)",
+                                  min_value=1, max_value=100, value=auto_rooms, step=1,
+                                  key=f"n_rooms_{sig}_{n}_{def_cap}"))
     rcols = st.columns(5)
     entries = []
+    left = n  # students not yet given a seat; the last needed room defaults to what is left (e.g. 7)
     for i in range(n_rooms):
+        cap_default = min(def_cap, left) if left > 0 else def_cap
+        left -= cap_default
         with rcols[i % 5]:
-            room = st.text_input(f"Room {i + 1}", "", key=f"room_{i}",
-                                 placeholder="Room number type pannunga").strip()
-            cap_i = int(st.number_input("Capacity", min_value=1, max_value=35, value=def_cap,
-                                        step=1, key=f"cap_{i}_{def_cap}",
+            room = st.text_input(f"Room {i + 1}", saved_names[i] if i < len(saved_names) else "",
+                                 key=f"room_{i}", placeholder="Room number type pannunga").strip()
+            cap_i = int(st.number_input("Capacity", min_value=1, max_value=35, value=cap_default,
+                                        step=1, key=f"cap_{i}_{def_cap}_{n}_{cap_default}",
                                         label_visibility="collapsed"))
         entries.append({"room": room, "cap": cap_i})
+
+    # remember room names + default capacity for the next exam
+    names_now = [e["room"] for e in entries]
+    if any(names_now):
+        on_disk = load_room_cfg()
+        merged = names_now + on_disk["room_names"][len(names_now):]  # keep names of unused rooms
+        if merged != on_disk["room_names"] or def_cap != on_disk["default_capacity"]:
+            save_room_cfg({"default_capacity": def_cap, "room_names": merged})
 
     rooms = [e["room"] for e in entries]
     if "" in rooms:
@@ -597,7 +640,7 @@ def main():
             break
     last_room = rooms[need - 1]
     last = n - (run - caps[last_room])
-    st.write(f"{n} students ku **{need} rooms** venum  ({n_rooms} available, total capacity {total_cap}). "
+    st.write(f"{n} students ku **{need} rooms** venum  ({n_rooms} rooms set, total capacity {total_cap}). "
              f"Last room ({last_room}) la {last} students.")
 
     if st.button("Allocate", type="primary"):
