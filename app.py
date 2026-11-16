@@ -258,7 +258,7 @@ def make_notice_pdf(alloc, used_rooms, title, date, session):
     small.fontSize = NOTICE_FS
     small.leading = NOTICE_FS + 3
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=25, rightMargin=25, topMargin=25, bottomMargin=25)
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=25, rightMargin=25, topMargin=25, bottomMargin=25)
     el = [
         Paragraph(f"<b>{title}</b>", ss["Title"]),
         Paragraph(f"<b>DATE:</b> {date} &nbsp;&nbsp; <b>SESSION:</b> {session}", ss["Normal"]),
@@ -268,7 +268,7 @@ def make_notice_pdf(alloc, used_rooms, title, date, session):
     data = [["Dept", "SubCode", "Regno", "Roomno", "Total"]]
     for r in notice_rows(alloc, used_rooms):
         data.append([r["Dept"], r["SubCode"], Paragraph(r["Regno"], small), r["Roomno"], r["Total"]])
-    t = Table(data, colWidths=[58, 70, 290, 70, 55], repeatRows=1)
+    t = Table(data, colWidths=[75, 95, 430, 90, 70], repeatRows=1)
     t.setStyle(_table_style())
     el.append(t)
     doc.build(el)
@@ -276,12 +276,12 @@ def make_notice_pdf(alloc, used_rooms, title, date, session):
 
 
 def make_room_pdf(alloc, used_rooms, title, date, session, center, caps, sign_path=None):
-    """One A4 portrait page per room, in the university hall-chart format:
+    """One A4 landscape page per room, in the university hall-chart format:
     header block, Subcode/Total strip, then Stno | Dept(+subcode) | Regno grid
     (5 rows, seats numbered column-wise), signature line at the bottom."""
     ss = getSampleStyleSheet()
     margin = 28
-    width = A4[0] - 2 * margin
+    width = landscape(A4)[0] - 2 * margin
 
     title_st = ParagraphStyle("t", parent=ss["Normal"], fontName="Helvetica", fontSize=10, alignment=TA_CENTER)
     info_st = ParagraphStyle("i", parent=ss["Normal"], fontName="Helvetica-Bold", fontSize=8, leading=10)
@@ -290,8 +290,8 @@ def make_room_pdf(alloc, used_rooms, title, date, session, center, caps, sign_pa
     foot_st = ParagraphStyle("f", parent=ss["Normal"], fontName="Helvetica", fontSize=9)
 
     buf = io.BytesIO()
-    doc = SimpleDocTemplate(buf, pagesize=A4, leftMargin=margin, rightMargin=margin,
-                            topMargin=40, bottomMargin=30)
+    doc = SimpleDocTemplate(buf, pagesize=landscape(A4), leftMargin=margin, rightMargin=margin,
+                            topMargin=30, bottomMargin=20)
     el = []
     for k, room in enumerate(used_rooms):
         sub = alloc[alloc.room_no == room]
@@ -301,7 +301,7 @@ def make_room_pdf(alloc, used_rooms, title, date, session, center, caps, sign_pa
         cap = caps.get(room, len(regs))
 
         el.append(Paragraph(escape(str(title)), title_st))
-        el.append(Spacer(1, 22))
+        el.append(Spacer(1, 14))
 
         # header block
         P = lambda s: Paragraph(escape(str(s)), info_st)
@@ -340,7 +340,7 @@ def make_room_pdf(alloc, used_rooms, title, date, session, center, caps, sign_pa
         w_no, w_dept = group_w * 0.15, group_w * 0.28
         w_reg = group_w - w_no - w_dept
         longest = max(len(str(r)) for r in regs)
-        fs = min(9.5, (w_reg - 2) / (longest * 0.556))  # Helvetica-Bold digit = 0.556 em
+        fs = min(13, (w_reg - 2) / (longest * 0.556))  # Helvetica-Bold digit = 0.556 em
 
         head = ["Stno", "Dept", "Regno"] * cols
         data = [head]
@@ -350,13 +350,18 @@ def make_room_pdf(alloc, used_rooms, title, date, session, center, caps, sign_pa
                 i = at.get((r, c))
                 if i is not None:
                     dept_cell = Paragraph(
-                        f'<font size="8"><b>{escape(str(depts[i]))}</b></font><br/>'
-                        f'<font size="6">{escape(str(codes[i]))}</font>', dept_st)
+                        f'<font size="10"><b>{escape(str(depts[i]))}</b></font><br/>'
+                        f'<font size="7">{escape(str(codes[i]))}</font>', dept_st)
                     line += [i + 1, dept_cell, regs[i]]
                 else:
                     line += ["", "", ""]
             data.append(line)
-        t = Table(data, colWidths=[w_no, w_dept, w_reg] * cols, rowHeights=[24] + [30] * ROWS)
+        sig_h = 14
+        if sign_path and Path(sign_path).exists():
+            w0, h0 = PILImage.open(sign_path).size
+            sig_h = 165 * h0 / w0
+        row_h = max(30, min(80, (522 - 199 - sig_h) / ROWS))
+        t = Table(data, colWidths=[w_no, w_dept, w_reg] * cols, rowHeights=[28] + [row_h] * ROWS)
         style = [
             ("GRID", (0, 0), (-1, -1), 0.75, colors.black),
             ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold"),
@@ -369,9 +374,9 @@ def make_room_pdf(alloc, used_rooms, title, date, session, center, caps, sign_pa
         ]
         for c in range(cols):  # Stno column a bit smaller
             style.append(("FONTSIZE", (3 * c, 0), (3 * c, 0), 6))
-            style.append(("FONTSIZE", (3 * c, 1), (3 * c, -1), 8))
+            style.append(("FONTSIZE", (3 * c, 1), (3 * c, -1), 10))
         t.setStyle(TableStyle(style))
-        el += [t, Spacer(1, 40)]
+        el += [t, Spacer(1, 26)]
 
         left_txt = Paragraph("Name Sign of Hall Superintendent(Name in Block Letters)", foot_st)
         if sign_path and Path(sign_path).exists():
