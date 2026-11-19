@@ -78,6 +78,7 @@ def allocate(students, rooms):
     queues = {g: list(x.index) for g, x in students.groupby("_g")}
     placed = []  # (room_no, student_index)
     used_rooms = []
+    carry = set()  # groups that were in the previous room and still have students left
     for room, cap in rooms:
         if not any(queues.values()):
             break
@@ -88,7 +89,8 @@ def allocate(students, rooms):
                 break
             cand = ([g for g in avail if sub_of[g] not in used_subs]
                     or [g for g in avail if g not in used] or avail)
-            g = max(cand, key=lambda x: len(queues[x]))
+            # continue the departments of the previous room first (e.g. AIDS 14.. + CSE 13..)
+            g = max(cand, key=lambda x: (x in carry, len(queues[x])))
             others = ([x for x in avail if x not in used and sub_of[x] != sub_of[g]]
                       or [x for x in avail if x != g and x not in used])
             n = (left + 1) // 2 if (others and not used) else left
@@ -100,6 +102,7 @@ def allocate(students, rooms):
             used_subs.add(sub_of[g])
             left -= n
         used_rooms.append(room)
+        carry = {g for g in used if queues[g]}
     if any(queues.values()):
         raise ValueError("Rooms podhala! Innum rooms add pannunga.")
     # seat order inside each room (column-wise numbering, see room_grid):
